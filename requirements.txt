@@ -1,0 +1,6 @@
+sqlalchemy==2.0.23
+pg8000==1.30.4
+pandas==2.1.4
+tqdm==4.66.1
+ijson==3.2.0
+python-dotenv==1.0.0

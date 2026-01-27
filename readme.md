@@ -1,0 +1,7 @@
+Программа по переносу данных из большого файла json в posgresql с использованием docker. Для запуска выполнить: 
+0) активировать окружение venv 
+1) pip install -r requirements.txt
+1)  docker-compose up -d для запуска docker и находящегося в нем postgres, остановка docker-compose down, Просмотр логов docker-compose logs -f postgres
+2)  python test_connnection.py для проверки работоспособности
+3)  python loader.py для начала чтения "по кускам" исходного файла
+4)  для просмотра изменений использовать dbeaver, взяв значения из файла config и установив подключение к бд
