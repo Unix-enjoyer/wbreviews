@@ -1,0 +1,625 @@
+# optimized_loader_nd.py
+import json
+import logging
+import os
+import gc
+import time
+import sys
+import signal
+import psutil
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+from tqdm import tqdm
+import concurrent.futures
+
+# Импорты из корня проекта
+from database import SessionLocal, Product, create_tables, optimize_database_for_loading, restore_database_settings, \
+    create_indexes_after_loading
+from config_nd import config_nd
+from sqlalchemy import text
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('products_loader.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Глобальные переменные для graceful shutdown
+SHOULD_STOP = False
+LAST_STATUS_TIME = time.time()
+
+
+def signal_handler(signum, frame):
+    """Обработчик сигналов для graceful shutdown"""
+    global SHOULD_STOP
+    logger.warning(f"Получен сигнал {signum}. Сохранение контрольной точки...")
+    SHOULD_STOP = True
+
+
+class MemoryMonitor:
+    """Минималистичный мониторинг памяти"""
+
+    @staticmethod
+    def get_memory_usage() -> float:
+        """Возвращает использование памяти в процентах"""
+        try:
+            return psutil.virtual_memory().percent
+        except:
+            return 0.0
+
+    @staticmethod
+    def check_memory_limit(limit_percent: float = 88.0) -> bool:
+        """Проверяет, превышен ли лимит памяти"""
+        usage = MemoryMonitor.get_memory_usage()
+        return usage > limit_percent
+
+    @staticmethod
+    def free_memory():
+        """Освобождает память"""
+        gc.collect()
+
+
+class CheckpointManager:
+    """Менеджер контрольных точек для сохранения прогресса"""
+
+    def __init__(self, checkpoint_file='checkpoint.json'):
+        self.checkpoint_file = checkpoint_file
+
+    def save_checkpoint(self, file_path: str, byte_position: int, line_number: int,
+                        inserted_count: int):
+        """Сохраняет контрольную точку"""
+        checkpoint = {
+            'file_path': str(file_path),
+            'byte_position': byte_position,
+            'line_number': line_number,
+            'inserted_count': inserted_count,
+            'timestamp': datetime.now().isoformat(),
+            'reason': 'manual' if SHOULD_STOP else 'memory_limit'
+        }
+
+        try:
+            with open(self.checkpoint_file, 'w', encoding='utf-8') as f:
+                json.dump(checkpoint, f, indent=2, ensure_ascii=False)
+            logger.info(f"Контрольная точка сохранена: {Path(file_path).name}, строка {line_number:,}")
+        except Exception as e:
+            logger.error(f"Ошибка сохранения контрольной точки: {e}")
+
+    def load_checkpoint(self) -> Optional[Dict[str, Any]]:
+        """Загружает контрольную точку"""
+        try:
+            if os.path.exists(self.checkpoint_file):
+                with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
+                    checkpoint = json.load(f)
+                logger.info(f"Загружена контрольная точка: {Path(checkpoint['file_path']).name}")
+                logger.info(f"Позиция: строка {checkpoint['line_number']:,}, байт {checkpoint['byte_position']:,}")
+                return checkpoint
+        except Exception as e:
+            logger.error(f"Ошибка загрузки контрольной точки: {e}")
+        return None
+
+    def clear_checkpoint(self):
+        """Удаляет контрольную точку"""
+        try:
+            if os.path.exists(self.checkpoint_file):
+                os.remove(self.checkpoint_file)
+                logger.info("Контрольная точка очищена")
+        except Exception as e:
+            logger.error(f"Ошибка удаления контрольной точки: {e}")
+
+
+def parse_product_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Парсит один элемент продукта из JSON
+    Согласно описанию датасета:
+    - imt_id: Identifier for the item (integer)
+    - nm_id: Numeric identifier associated with the item (integer)
+    - imt_name: Name of the product (string)
+    - subj_name: Subject name (string)
+    - subj_root_name: Root subject name (string)
+    - nm_colors_names: Colors names (string, may be empty)
+    - vendor_code: Vendor code (string)
+    - description: Description of the product (string, may be empty)
+    - brand_name: Name of the brand (string)
+    """
+    try:
+        # Извлекаем поля согласно описанию датасета
+        imt_id = item.get('imt_id')
+        nm_id = item.get('nm_id')
+
+        # Проверяем альтернативные названия полей
+        if imt_id is None:
+            imt_id = item.get('imtId') or item.get('imtID')
+
+        if nm_id is None:
+            nm_id = item.get('nmId') or item.get('nmID')
+
+        # nm_id обязателен
+        if nm_id is None:
+            return None
+
+        # Преобразование типов
+        try:
+            nm_id_int = int(nm_id)
+        except (ValueError, TypeError):
+            # Пробуем очистить строку
+            import re
+            cleaned = re.sub(r'[^\d]', '', str(nm_id))
+            nm_id_int = int(cleaned) if cleaned else 0
+
+        if nm_id_int == 0:
+            return None
+
+        # imt_id может быть None
+        imt_id_int = None
+        if imt_id is not None:
+            try:
+                imt_id_int = int(imt_id)
+            except:
+                import re
+                cleaned = re.sub(r'[^\d]', '', str(imt_id))
+                imt_id_int = int(cleaned) if cleaned else None
+
+        # Извлекаем остальные поля
+        imt_name = item.get('imt_name') or item.get('imtName') or ''
+        subj_name = item.get('subj_name') or item.get('subjName') or ''
+        subj_root_name = item.get('subj_root_name') or item.get('subjRootName') or ''
+        nm_colors_names = item.get('nm_colors_names') or item.get('nmColorsNames') or ''
+        vendor_code = item.get('vendor_code') or item.get('vendorCode') or ''
+        description = item.get('description') or ''
+        brand_name = item.get('brand_name') or item.get('brandName') or 'Неизвестный бренд'
+
+        return {
+            'imt_id': imt_id_int,
+            'nm_id': nm_id_int,
+            'imt_name': str(imt_name)[:500],
+            'subj_name': str(subj_name)[:200],
+            'subj_root_name': str(subj_root_name)[:200],
+            'nm_colors_names': str(nm_colors_names)[:500],
+            'vendor_code': str(vendor_code)[:100],
+            'description': str(description),
+            'brand_name': str(brand_name)[:200]
+        }
+
+    except Exception as e:
+        logger.debug(f"Ошибка парсинга продукта: {e}")
+        return None
+
+
+def process_chunk_parallel(chunk_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Обрабатывает чанк параллельно"""
+    processed = []
+
+    for item in chunk_data:
+        parsed = parse_product_item(item)
+        if parsed:
+            processed.append(parsed)
+
+    return processed
+
+
+def fast_insert_batch_products(batch_data: List[Dict[str, Any]]) -> int:
+    """Быстрая вставка батча продуктов"""
+    if not batch_data:
+        return 0
+
+    session = SessionLocal()
+
+    try:
+        session.bulk_insert_mappings(Product, batch_data)
+        session.commit()
+        return len(batch_data)
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Ошибка вставки батча: {e}")
+
+        # Fallback: вставка по одному
+        inserted = 0
+        for item in batch_data:
+            try:
+                product = Product(**item)
+                session.add(product)
+                inserted += 1
+                if inserted % 100 == 0:
+                    session.commit()
+            except Exception:
+                continue
+
+        try:
+            session.commit()
+        except:
+            session.rollback()
+
+        return inserted
+    finally:
+        session.close()
+
+
+def print_status(current_file: str, lines_read: int, inserted_count: int,
+                 memory_usage: float, start_time: datetime):
+    """Печатает статус загрузки в терминал и лог"""
+    elapsed_time = datetime.now() - start_time
+    elapsed_hours = elapsed_time.total_seconds() / 3600
+
+    lines_k = lines_read // 1000
+    lines_m = lines_read // 1000000
+
+    if lines_read > 0:
+        speed_per_hour = lines_read / elapsed_hours if elapsed_hours > 0 else 0
+
+        # Формируем сообщение
+        status_msg = (f"[СТАТУС] Файл: {Path(current_file).name} | "
+                      f"Прочитано: {lines_m} млн ({lines_read:,}) записей | "
+                      f"Вставлено: {inserted_count:,} | "
+                      f"Память: {memory_usage:.1f}% | "
+                      f"Время: {elapsed_time} | "
+                      f"Скорость: {speed_per_hour:,.0f} записей/час")
+
+        # Выводим в терминал
+        print(status_msg)
+
+        # Логируем в файл
+        logger.info(status_msg)
+
+
+def process_file_with_checkpoint(file_path: Path, checkpoint_manager: CheckpointManager,
+                                 start_byte: int = 0, start_line: int = 0) -> Tuple[int, int, int]:
+    """Обрабатывает один файл с поддержкой контрольных точек"""
+    global SHOULD_STOP, LAST_STATUS_TIME
+
+    logger.info(f"Начало обработки: {file_path.name}")
+    logger.info(f"Стартовая позиция: байт {start_byte:,}, строка {start_line:,}")
+
+    if not file_path.exists():
+        logger.error(f"Файл не найден: {file_path}")
+        return 0, 0, 0
+
+    # Статистика
+    stats = {
+        'total_read': 0,
+        'total_processed': 0,
+        'total_inserted': 0,
+        'start_time': datetime.now()
+    }
+
+    # Инициализируем мониторинг памяти
+    memory_monitor = MemoryMonitor()
+
+    # Чтение файла с возможностью продолжить с позиции
+    chunk = []
+    chunk_size = 10000
+    insert_batch = []
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            # Переходим на сохраненную позицию
+            if start_byte > 0:
+                f.seek(start_byte)
+                # Пропускаем неполную строку
+                if start_byte > 0:
+                    f.readline()
+                    stats['total_read'] += 1
+
+            current_byte_position = start_byte
+
+            # Читаем файл построчно
+            for line in f:
+                current_byte_position += len(line.encode('utf-8'))
+
+                # Проверяем память каждые 1000 строк
+                if stats['total_read'] % 1000 == 0:
+                    memory_usage = memory_monitor.get_memory_usage()
+
+                    # Проверяем лимит памяти
+                    if memory_monitor.check_memory_limit(88.0):
+                        logger.error(f"Память превысила 88%: {memory_usage:.1f}%")
+                        logger.error("Сохранение контрольной точки и завершение...")
+                        checkpoint_manager.save_checkpoint(
+                            str(file_path),
+                            current_byte_position,
+                            stats['total_read'],
+                            stats['total_inserted']
+                        )
+                        SHOULD_STOP = True
+
+                # Проверяем флаг остановки
+                if SHOULD_STOP:
+                    logger.warning("Обработка прервана")
+                    return stats['total_read'], stats['total_processed'], stats['total_inserted']
+
+                stats['total_read'] += 1
+
+                # Выводим статус каждые 50,000 записей
+                if stats['total_read'] % 50000 == 0:
+                    memory_usage = memory_monitor.get_memory_usage()
+                    print_status(str(file_path), stats['total_read'], stats['total_inserted'],
+                                 memory_usage, stats['start_time'])
+                    LAST_STATUS_TIME = time.time()
+
+                try:
+                    data = json.loads(line.strip())
+                    chunk.append(data)
+
+                    # Обрабатываем чанк
+                    if len(chunk) >= chunk_size:
+                        processed = process_chunk_parallel(chunk)
+                        stats['total_processed'] += len(processed)
+                        insert_batch.extend(processed)
+                        chunk = []
+
+                        # Вставляем батч
+                        if len(insert_batch) >= 2000:
+                            inserted = fast_insert_batch_products(insert_batch)
+                            stats['total_inserted'] += inserted
+                            insert_batch = []
+
+                            # Освобождаем память после вставки
+                            memory_monitor.free_memory()
+
+                except json.JSONDecodeError:
+                    continue
+                except Exception as e:
+                    logger.debug(f"Ошибка обработки строки: {e}")
+
+        # Обработка последнего чанка
+        if chunk:
+            processed = process_chunk_parallel(chunk)
+            stats['total_processed'] += len(processed)
+            insert_batch.extend(processed)
+
+        # Вставка оставшихся данных
+        if insert_batch:
+            inserted = fast_insert_batch_products(insert_batch)
+            stats['total_inserted'] += inserted
+
+    except Exception as e:
+        logger.error(f"Ошибка чтения файла {file_path.name}: {e}")
+        # Сохраняем контрольную точку при ошибке
+        if not SHOULD_STOP:
+            logger.warning("Сохранение контрольной точки из-за ошибки...")
+            checkpoint_manager.save_checkpoint(
+                str(file_path),
+                current_byte_position,
+                stats['total_read'],
+                stats['total_inserted']
+            )
+        raise
+
+    # Финальный статус после обработки файла
+    memory_usage = memory_monitor.get_memory_usage()
+    print_status(str(file_path), stats['total_read'], stats['total_inserted'],
+                 memory_usage, stats['start_time'])
+
+    # Статистика файла
+    stats['end_time'] = datetime.now()
+    stats['duration'] = stats['end_time'] - stats['start_time']
+
+    logger.info(f"Файл {file_path.name} обработан:")
+    logger.info(f"  Прочитано: {stats['total_read']:,}")
+    logger.info(f"  Обработано: {stats['total_processed']:,}")
+    logger.info(f"  Вставлено: {stats['total_inserted']:,}")
+    logger.info(f"  Время: {stats['duration']}")
+
+    if stats['total_read'] > 0:
+        efficiency = (stats['total_processed'] / stats['total_read']) * 100
+        speed = stats['total_read'] / stats['duration'].total_seconds() if stats['duration'].total_seconds() > 0 else 0
+        logger.info(f"  Эффективность: {efficiency:.1f}%")
+        logger.info(f"  Скорость: {speed:.1f} строк/сек")
+
+    return stats['total_read'], stats['total_processed'], stats['total_inserted']
+
+
+def main():
+    """Основная функция загрузки с поддержкой контрольных точек"""
+    global SHOULD_STOP
+
+    # Регистрируем обработчики сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Заголовок программы
+    print("=" * 100)
+    print("ЗАГРУЗЧИК ПРОДУКТОВ WILDBERRIES С КОНТРОЛЬНЫМИ ТОЧКАМИ И МОНИТОРИНГОМ ПАМЯТИ")
+    print("=" * 100)
+    print("Мониторинг памяти: при превышении 88% программа сохранит контрольную точку и завершится")
+    print("Статус выводится каждые 50,000 записей")
+    print("=" * 100)
+
+    # Инициализируем менеджер контрольных точек
+    checkpoint_manager = CheckpointManager()
+
+    # Пытаемся загрузить контрольную точку
+    checkpoint = checkpoint_manager.load_checkpoint()
+    resume_from_checkpoint = checkpoint is not None
+
+    # Определяем, с какого файла и позиции начинать
+    start_file_path = None
+    start_byte = 0
+    start_line = 0
+    start_inserted = 0
+
+    if resume_from_checkpoint:
+        start_file_path = Path(checkpoint['file_path'])
+        start_byte = checkpoint.get('byte_position', 0)
+        start_line = checkpoint.get('line_number', 0)
+        start_inserted = checkpoint.get('inserted_count', 0)
+        logger.info(f"Продолжение с контрольной точки: {start_inserted:,} уже вставлено")
+        print(f"  Продолжение с контрольной точки: {start_inserted:,} уже вставлено")
+
+    # Проверяем доступные файлы
+    files_to_process = []
+    for file_path in config_nd.json_files_absolute:
+        if file_path.exists():
+            files_to_process.append(file_path)
+            file_size = file_path.stat().st_size / (1024 * 1024)
+            logger.info(f"  {file_path.name}: {file_size:.1f} MB")
+            print(f"  {file_path.name}: {file_size:.1f} MB")
+        else:
+            logger.warning(f"✗ Файл не найден: {file_path.name}")
+            print(f"✗ Файл не найден: {file_path.name}")
+
+    if not files_to_process:
+        logger.error("Не найдено файлов для обработки")
+        print("  Не найдено файлов для обработки")
+        return
+
+    logger.info(f"Всего файлов: {len(files_to_process)}")
+    print(f"  Всего файлов: {len(files_to_process)}")
+
+    # Создаем таблицы
+    print("   Создание таблиц...")
+    create_tables()
+
+    # Оптимизируем БД
+    print("   Оптимизация БД для загрузки...")
+    optimize_database_for_loading()
+
+    # Глобальная статистика
+    global_stats = {
+        'total_files': len(files_to_process),
+        'files_processed': 0,
+        'total_read': 0,
+        'total_processed': 0,
+        'total_inserted': start_inserted,
+        'start_time': datetime.now()
+    }
+
+    # Определяем, с какого файла начинать обработку
+    start_index = 0
+    if resume_from_checkpoint and start_file_path:
+        # Находим индекс файла в списке
+        for i, file_path in enumerate(files_to_process):
+            if file_path == start_file_path:
+                start_index = i
+                break
+        logger.info(f"Начинаем с файла {start_index + 1}: {start_file_path.name}")
+        print(f"🚀 Начинаем с файла {start_index + 1}: {start_file_path.name}")
+
+    # Обрабатываем файлы
+    for file_index in range(start_index, len(files_to_process)):
+        file_path = files_to_process[file_index]
+
+        print(f"\n{'=' * 100}")
+        print(f"  Файл {file_index + 1}/{len(files_to_process)}: {file_path.name}")
+        print(f"{'=' * 100}")
+
+        try:
+            # Определяем стартовую позицию для этого файла
+            current_start_byte = start_byte if (resume_from_checkpoint and file_index == start_index) else 0
+            current_start_line = start_line if (resume_from_checkpoint and file_index == start_index) else 0
+
+            read, processed, inserted = process_file_with_checkpoint(
+                file_path,
+                checkpoint_manager,
+                start_byte=current_start_byte,
+                start_line=current_start_line
+            )
+
+            global_stats['files_processed'] += 1
+            global_stats['total_read'] += read
+            global_stats['total_processed'] += processed
+            global_stats['total_inserted'] += inserted
+
+            # После успешной обработки файла очищаем контрольную точку
+            if not SHOULD_STOP:
+                checkpoint_manager.clear_checkpoint()
+                logger.info(f"Файл {file_path.name} полностью обработан, контрольная точка очищена")
+                print(f"  Файл {file_path.name} полностью обработан, контрольная точка очищена")
+
+            # Пауза между файлами
+            if file_index < len(files_to_process) - 1 and not SHOULD_STOP:
+                logger.info("Пауза 5 секунд перед следующим файлом...")
+                print("    Пауза 5 секунд перед следующим файлом...")
+                time.sleep(5)
+
+        except Exception as e:
+            logger.error(f"Ошибка обработки файла: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            continue
+
+        # Прерываем обработку если получен сигнал или превышена память
+        if SHOULD_STOP:
+            logger.warning("Загрузка прервана")
+            print("\n ️  Загрузка прервана")
+            break
+
+    # Восстанавливаем настройки БД только если не было прерывания
+    if not SHOULD_STOP:
+        print("\n  Восстановление настроек БД...")
+        restore_database_settings()
+        create_indexes_after_loading()
+
+    # Итоги
+    global_stats['end_time'] = datetime.now()
+    global_stats['duration'] = global_stats['end_time'] - global_stats['start_time']
+
+    print(f"\n{'=' * 100}")
+    print("  ИТОГИ ЗАГРУЗКИ:")
+    print(f"{'=' * 100}")
+    print(f"Обработано файлов: {global_stats['files_processed']}/{global_stats['total_files']}")
+    print(f"Всего прочитано: {global_stats['total_read']:,}")
+    print(f"Успешно обработано: {global_stats['total_processed']:,}")
+    print(f"Вставлено в БД: {global_stats['total_inserted']:,}")
+    print(f"Общее время: {global_stats['duration']}")
+
+    # Логируем итоги
+    logger.info("\nИТОГИ ЗАГРУЗКИ:")
+    logger.info(f"Обработано файлов: {global_stats['files_processed']}/{global_stats['total_files']}")
+    logger.info(f"Всего прочитано: {global_stats['total_read']:,}")
+    logger.info(f"Успешно обработано: {global_stats['total_processed']:,}")
+    logger.info(f"Вставлено в БД: {global_stats['total_inserted']:,}")
+    logger.info(f"Общее время: {global_stats['duration']}")
+
+    if global_stats['duration'].total_seconds() > 0:
+        speed = global_stats['total_read'] / global_stats['duration'].total_seconds()
+        print(f"Средняя скорость: {speed:.1f} строк/сек")
+        logger.info(f"Средняя скорость: {speed:.1f} строк/сек")
+
+    # Проверяем итоговое количество если не было прерывания
+    if not SHOULD_STOP:
+        print("\n  Проверка итогового количества записей...")
+        session = SessionLocal()
+        try:
+            from sqlalchemy import func
+            total_products = session.query(func.count(Product.id)).scalar()
+            print(f"  Всего продуктов в таблице: {total_products:,}")
+            logger.info(f"Всего продуктов в таблице: {total_products:,}")
+
+        finally:
+            session.close()
+
+    print(f"\n{'=' * 100}")
+
+    if SHOULD_STOP:
+        print("   Загрузка была прервана. Для продолжения запустите программу снова.")
+        print(f"  Контрольная точка сохранена в файле: checkpoint.json")
+        logger.warning("Загрузка была прервана. Для продолжения запустите программу снова.")
+        logger.info("Контрольная точка сохранена в файле: checkpoint.json")
+    else:
+        print("  Загрузка завершена успешно!")
+        logger.info("Загрузка завершена успешно!")
+
+    print("=" * 100)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n   Загрузка прервана пользователем (Ctrl+C)")
+        logger.warning("Загрузка прервана пользователем (Ctrl+C)")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n  Критическая ошибка: {e}")
+        logger.error(f"Критическая ошибка: {e}")
+        import traceback
+
+        traceback.print_exc()
+        logger.error(traceback.format_exc())
+        sys.exit(1)
