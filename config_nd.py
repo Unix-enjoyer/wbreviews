@@ -17,11 +17,22 @@ class Config:
 
     # SQLAlchemy connection URL
     SQLALCHEMY_DATABASE_URL = f"postgresql+pg8000://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-
+    # basket-01.json...
+    # basket-02.json
+    # basket-03.json
+    # basket-04.json
+    # basket-05.json
+    # basket-06.json
+    # basket-07.json
+    # basket-08.json
+    # basket-09.json
+    # basket-10.json
+    # basket-11.json
+    # basket-12.json+
     # JSON файлы для обработки
-    JSON_FILES = [
-        f"basket-{i:02d}.json" for i in range(7, 8)  # basket-01.json, basket-02.json, ...
-    ] #proceed part o ffile 1. try file 7
+    JSON_FILES = ["basket-01.json"]
+        #f"basket-{i:02d}.json" for i in range(1, 2)  # basket-01.json, basket-02.json, ...
+    #] proceed ffile 1
 
     # Настройки загрузки
     CHUNK_SIZE_LINES = 10000  # Размер чанка для чтения файлов
